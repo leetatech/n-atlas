@@ -139,7 +139,7 @@ async def handle_whatsapp_webhook(request: Request, background_tasks: Background
     if num_media > 0 and ("audio" in media_content_type or "ogg" in media_content_type):
         media_url = form_data.get("MediaUrl0", "")
         background_tasks.add_task(
-            process_voice_note_background,
+            process_incoming_message_background,
             media_url=media_url,
             sender_id=sender_id,
             message_sid=message_sid
