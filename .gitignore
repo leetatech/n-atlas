@@ -2,3 +2,5 @@
 venv/*
 src/__pycache__/*
 __pycache__/*
+data/*.sqlite3*
+tests/__pycache__/*

@@ -1,5 +1,7 @@
 from pathlib import Path
 import httpx
+import tempfile
+import os
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, File, UploadFile
 from fastapi.responses import Response, FileResponse    
 from twilio.request_validator import RequestValidator
@@ -9,7 +11,7 @@ from src.config import STORAGE_DIR, TWILIO_AUTH_TOKEN, TWILIO_ACCOUNT_SID
 from src.audio_processor import transcode_to_wav_16k
 from src.asr_engine import asr_service
 from src.intent_parser import extract_gas_order_intent
-from src.leeta_service import create_leeta_draft_order, send_whatsapp_message
+from src.conversation import handle_user_message
 
 app = FastAPI(title="Leeta WhatsApp Voice & Text Engine")
 validator = RequestValidator(TWILIO_AUTH_TOKEN)
@@ -22,79 +24,65 @@ async def serve_audio_file(filename: str):
         return FileResponse(path=file_path, media_type="audio/ogg")
     raise HTTPException(status_code=404, detail="Audio file not found")
 
+async def _download_twilio_audio(media_url: str) -> str:
+    """
+    Downloads Twilio voice media (.ogg/.amr/.wav) to a temporary local file
+    so transformers pipeline can process it.
+    """
+    auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    async with httpx.AsyncClient() as client:
+        response = await client.get(media_url, auth=auth, follow_redirects=True)
+        if response.status_code != 200:
+            raise ValueError(f"Failed to download audio from Twilio: status {response.status_code}")
+        
+        # Save audio payload to temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as tmp_file:
+            tmp_file.write(response.content)
+            return tmp_file.name
+
 
 async def process_incoming_message_background(
-    sender_id: str, 
-    message_sid: str, 
-    is_voice: bool, 
-    text_content: str = None, 
+    sender_id: str,
+    message_sid: str,
+    is_voice: bool,
+    public_base_url: str,
     media_url: str = None,
-    public_base_url: str = ""
+    text_content: str = None
 ):
-    """Processes message (text or voice note) and matches input format on reply."""
+    """
+    Background worker that handles WhatsApp incoming messages.
+    Automatically detects Yoruba (yo), Hausa (ha), or Igbo (ig) if it's a voice note.
+    """
     raw_text = ""
+    detected_lang = "en"
+    lang_name = "English"
 
-    # 1. Obtain input text (direct or transcribed)
     if is_voice and media_url:
-        raw_file = STORAGE_DIR / f"{message_sid}.ogg"
-        wav_file = STORAGE_DIR / f"{message_sid}_16k.wav"
+        temp_audio_path = None
+        try:
+            print(f"[Worker] Downloading voice note from: {media_url}")
+            temp_audio_path = await _download_twilio_audio(media_url)
 
-        async with httpx.AsyncClient() as client:
-            res = await client.get(media_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), follow_redirects=True)
-            if res.status_code == 200:
-                raw_file.write_bytes(res.content)
-            else:
-                return
+            # 1. Transcribe & detect spoken language via NCAIR1 ASR models
+            asr_result = asr_service.transcribe_and_detect_language(temp_audio_path)
+            
+            raw_text = asr_result["transcription"]
+            detected_lang = asr_result["language"]
+            lang_name = asr_result["language_name"]
 
-        if not transcode_to_wav_16k(raw_file, wav_file):
-            return
+            print(f"[NCAIR1 ASR Success] Spoken Language: {lang_name} ({detected_lang}) | Transcript: '{raw_text}'")
 
-        raw_text = asr_service.transcribe(str(wav_file))
-        
-        if raw_file.exists(): raw_file.unlink()
-        if wav_file.exists(): wav_file.unlink()
+        except Exception as e:
+            print(f"[ASR Background Error]: {e}")
+            raw_text = ""
+        finally:
+            if temp_audio_path and os.path.exists(temp_audio_path):
+                os.remove(temp_audio_path)
     else:
         raw_text = text_content or ""
+        detected_lang = "en"  # Default for plain text, or pass to text-based language detector
 
-    # 2. Extract Intent & Cylinder Size
-    intent = extract_gas_order_intent(raw_text)
-
-    # 3. Formulate Text Response
-    if intent["is_order_intent"] and intent["cylinder_size_kg"]:
-        size = intent["cylinder_size_kg"]
-        order = await create_leeta_draft_order(sender_id, size, raw_text)
-
-        reply_text = (
-            f"Ẹ ṣeun! A ti gba ìbéèrè yín tí gáàsì {size}kg nínú Leeta. "
-            f"Ọ̀pọ̀lọpọ̀ Owo ni ₦{order.get('estimated_price_ngn', 'N/A'):,}. "
-            f"Order ID ni {order.get('order_id')}. "
-            f"Ṣẹ́ e fẹ́ kí á fi ránṣẹ́ sí ilé yín? Ṣe àtìlẹ́yìn pẹ̀lú 'BẸ́Ẹ̀ NI' láti tẹ̀síwájú."
-        )
-    elif intent["is_order_intent"]:
-        reply_text = (
-            f"A gbọ́ pé ẹ fẹ́ ra gáàsì! "
-            f"Ẹ jọ̀wọ́, kg kílógírámù mélòó ni ẹ fẹ́ ra? Àpẹẹrẹ: 6kg, 12.5kg, 25kg."
-        )
-    else:
-        reply_text = (
-            f"A gbọ́ àkọsílẹ̀ yín: '{raw_text}'. "
-            f"Ẹ le sọ fún wa bí ẹ ṣe fẹ́ ra gáàsì Leeta."
-        )
-
-    # 4. Deliver response matching incoming modality (Voice -> Voice, Text -> Text)
-    if is_voice:
-        output_ogg_filename = f"reply_{message_sid}.ogg"
-        output_ogg_path = STORAGE_DIR / output_ogg_filename
-        
-        # Generate TTS audio file
-        if generate_tts_ogg(reply_text, output_ogg_path):
-            audio_public_url = f"{public_base_url}/static/audio/{output_ogg_filename}"
-            await send_whatsapp_message(sender_id, message_body=" Voice note reply from Leeta:", media_url=audio_public_url)
-        else:
-            # Fallback to text if TTS fails
-            await send_whatsapp_message(sender_id, message_body=reply_text)
-    else:
-        await send_whatsapp_message(sender_id, message_body=reply_text)
+    await handle_user_message(sender_id, message_sid, raw_text, detected_lang)
 
 
 @app.get("/health")
@@ -113,7 +101,8 @@ async def test_leeta_voice_endpoint(file: UploadFile = File(...)):
     if not transcode_to_wav_16k(temp_input, temp_wav):
         raise HTTPException(status_code=400, detail="FFmpeg transcoding failed.")
 
-    transcription = asr_service.transcribe(str(temp_wav))
+    asr_result = asr_service.transcribe_and_detect_language(str(temp_wav))
+    transcription = asr_result["transcription"]
     intent = extract_gas_order_intent(transcription)
 
     if temp_input.exists(): temp_input.unlink()
@@ -122,7 +111,7 @@ async def test_leeta_voice_endpoint(file: UploadFile = File(...)):
     return {
         "transcription": transcription,
         "parsed_intent": intent,
-        "action": "TRIGGER_LEETA_ORDER" if intent["is_order_intent"] and intent["cylinder_size_kg"] else "ASK_CLARIFICATION"
+        "action": "ASK_ADDRESS_AND_VENDOR" if intent["is_gas_order"] else "FIND_NEARBY_VENDORS"
     }
 
 
@@ -133,19 +122,35 @@ async def handle_whatsapp_webhook(request: Request, background_tasks: Background
     sender_id = form_data.get("From", "")
     message_sid = form_data.get("MessageSid", "")
     media_content_type = form_data.get("MediaContentType0", "")
+    incoming_body = form_data.get("Body", "").strip()
+    if not sender_id or not message_sid:
+        raise HTTPException(status_code=400, detail="From and MessageSid are required.")
 
+    public_base_url = str(request.base_url).rstrip("/")
     twiml_response = MessagingResponse()
 
-    if num_media > 0 and ("audio" in media_content_type or "ogg" in media_content_type):
+    is_voice = num_media > 0 and ("audio" in media_content_type or "ogg" in media_content_type or "amr" in media_content_type)
+
+    if is_voice:
         media_url = form_data.get("MediaUrl0", "")
         background_tasks.add_task(
             process_incoming_message_background,
-            media_url=media_url,
             sender_id=sender_id,
-            message_sid=message_sid
+            message_sid=message_sid,
+            is_voice=True,
+            public_base_url=public_base_url,
+            media_url=media_url
         )
-        twiml_response.message(" Mo ń gbọ́ ohùn yín, ẹ jọ̀wọ́ ẹ dúró fún ìṣẹ́jú kan...")
+        twiml_response.message("Mo ń gbọ́ ohùn yín, ẹ jọ̀wọ́ ẹ dúró fún ìṣẹ́jú kan...")
     else:
-        twiml_response.message("Ẹ kaabọ́ sí Leeta! Ẹ le fi ohùn ránṣẹ́ láti ra gáàsì (àpẹẹrẹ: 'Mo fẹ́ ra gáàsì 12.5kg').")
+        background_tasks.add_task(
+            process_incoming_message_background,
+            sender_id=sender_id,
+            message_sid=message_sid,
+            is_voice=False,
+            public_base_url=public_base_url,
+            text_content=incoming_body
+        )
+        twiml_response.message("Mo ti gba àkọsílẹ̀ yín...")
 
     return Response(content=str(twiml_response), media_type="application/xml")
